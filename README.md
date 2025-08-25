@@ -347,4 +347,3 @@ If you're having problems or need help:
 ## License
 
 MIT © 2025 Softeria
-
