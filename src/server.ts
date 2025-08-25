@@ -1,6 +1,3 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import express, { Request, Response } from 'express';
 import crypto from 'crypto';
@@ -436,4 +433,3 @@ class MicrosoftGraphServer {
 }
 
 export default MicrosoftGraphServer;
-
