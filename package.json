@@ -1,4 +1,4 @@
-
+{
   "name": "@softeria/ms-365-mcp-server",
   "version": "0.0.0-development",
   "description": " A Model Context Protocol (MCP) server for interacting with Microsoft 365 and Office services through the Graph API",
