@@ -1,6 +1,5 @@
 import type { AccountInfo, Configuration } from '@azure/msal-node';
 import { PublicClientApplication } from '@azure/msal-node';
-import keytar from 'keytar';
 import logger from './logger.js';
 import fs, { existsSync, readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -121,6 +120,7 @@ class AuthManager {
       let cacheData: string | undefined;
 
       try {
+        const keytar = (await import('keytar')).default;
         const cachedData = await keytar.getPassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT);
         if (cachedData) {
           cacheData = cachedData;
@@ -151,6 +151,7 @@ class AuthManager {
       let selectedAccountData: string | undefined;
 
       try {
+        const keytar = (await import('keytar')).default;
         const cachedData = await keytar.getPassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY);
         if (cachedData) {
           selectedAccountData = cachedData;
@@ -180,6 +181,7 @@ class AuthManager {
       const cacheData = this.msalApp.getTokenCache().serialize();
 
       try {
+        const keytar = (await import('keytar')).default;
         await keytar.setPassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT, cacheData);
       } catch (keytarError) {
         logger.warn(
@@ -198,6 +200,7 @@ class AuthManager {
       const selectedAccountData = JSON.stringify({ accountId: this.selectedAccountId });
 
       try {
+        const keytar = (await import('keytar')).default;
         await keytar.setPassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY, selectedAccountData);
       } catch (keytarError) {
         logger.warn(
@@ -377,6 +380,7 @@ class AuthManager {
       this.selectedAccountId = null;
 
       try {
+        const keytar = (await import('keytar')).default;
         await keytar.deletePassword(SERVICE_NAME, TOKEN_CACHE_ACCOUNT);
         await keytar.deletePassword(SERVICE_NAME, SELECTED_ACCOUNT_KEY);
       } catch (keytarError) {
