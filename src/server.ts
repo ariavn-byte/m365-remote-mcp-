@@ -1,41 +1,34 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
-import express, { Request, Response } from 'express';
-import crypto from 'crypto';
+import express, { Request, Response, NextFunction } from 'express';
 import logger, { enableConsoleLogging } from './logger.js';
 import { registerAuthTools } from './auth-tools.js';
 import { registerGraphTools } from './graph-tools.js';
 import GraphClient from './graph-client.js';
 import AuthManager from './auth.js';
-import { MicrosoftOAuthProvider } from './oauth-provider.js';
-import {
-  exchangeCodeForToken,
-  microsoftBearerTokenAuthMiddleware,
-  refreshAccessToken,
-} from './lib/microsoft-auth.js';
 import type { CommandOptions } from './cli.ts';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import type { IncomingMessage, ServerResponse } from 'http';
 
-// Store registered clients in memory (in production, use a database)
-interface RegisteredClient {
-  client_id: string;
-  client_name: string;
-  redirect_uris: string[];
-  grant_types: string[];
-  response_types: string[];
-  scope?: string;
-  token_endpoint_auth_method: string;
-  created_at: number;
+// Helper to get the directory name in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+interface EndpointInfo {
+  toolName: string;
+  method: string;
+  pathPattern: string;
 }
-
-const registeredClients = new Map<string, RegisteredClient>();
 
 class MicrosoftGraphServer {
   private authManager: AuthManager;
   private options: CommandOptions;
   private graphClient: GraphClient;
   private server: McpServer | null;
+  private version: string = '0.0.0';
 
   constructor(authManager: AuthManager, options: CommandOptions = {}) {
     this.authManager = authManager;
@@ -45,6 +38,7 @@ class MicrosoftGraphServer {
   }
 
   async initialize(version: string): Promise<void> {
+    this.version = version;
     this.server = new McpServer({
       name: 'Microsoft365MCP',
       version,
@@ -63,24 +57,80 @@ class MicrosoftGraphServer {
     );
   }
 
+  private generateOpenAPISpec(req: Request): Record<string, unknown> {
+    const serverUrl = `${req.protocol}://${req.get('host')}`;
+    const endpointsData: EndpointInfo[] = JSON.parse(
+      fs.readFileSync(path.join(__dirname, 'endpoints.json'), 'utf8')
+    );
+
+    const paths = endpointsData.reduce((acc: Record<string, unknown>, endpoint: EndpointInfo) => {
+      const path = `/mcp/${endpoint.toolName}`; // Create a unique path for each tool
+      if (!acc[path]) {
+        acc[path] = {};
+      }
+      // Assuming all tool calls are POST as per MCP over HTTP spec
+      (acc[path] as Record<string, unknown>)['post'] = {
+        summary: endpoint.toolName,
+        description: `Executes the ${endpoint.toolName} tool. Path from Graph API: ${endpoint.method.toUpperCase()} ${endpoint.pathPattern}`,
+        operationId: endpoint.toolName,
+        tags: ['Microsoft Graph'],
+        security: [{ bearerAuth: [] }],
+        requestBody: {
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  // Define a generic body for MCP requests
+                  jsonrpc: { type: 'string', example: '2.0' },
+                  method: { type: 'string', example: endpoint.toolName },
+                  params: { type: 'object' },
+                  id: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description: 'Successful tool execution response',
+          },
+        },
+      };
+      return acc;
+    }, {});
+
+    return {
+      openapi: '3.0.0',
+      info: {
+        title: 'Microsoft 365 MCP Server',
+        version: this.version,
+        description: 'A server providing tools to interact with Microsoft 365 APIs.',
+      },
+      servers: [
+        {
+          url: serverUrl,
+        },
+      ],
+      components: {
+        securitySchemes: {
+          bearerAuth: {
+            type: 'http',
+            scheme: 'bearer',
+            bearerFormat: 'API-KEY',
+          },
+        },
+      },
+      paths,
+    };
+  }
+
   async start(): Promise<void> {
     if (this.options.v) {
       enableConsoleLogging();
     }
 
     logger.info('Microsoft 365 MCP Server starting...');
-
-    // Debug: Check if environment variables are loaded
-    logger.info('Environment Variables Check:', {
-      CLIENT_ID: process.env.MS365_MCP_CLIENT_ID
-        ? `${process.env.MS365_MCP_CLIENT_ID.substring(0, 8)}...`
-        : 'NOT SET',
-      CLIENT_SECRET: process.env.MS365_MCP_CLIENT_SECRET
-        ? `${process.env.MS365_MCP_CLIENT_SECRET.substring(0, 8)}...`
-        : 'NOT SET',
-      TENANT_ID: process.env.MS365_MCP_TENANT_ID || 'NOT SET',
-      NODE_ENV: process.env.NODE_ENV || 'NOT SET',
-    });
 
     if (this.options.readOnly) {
       logger.info('Server running in READ-ONLY mode. Write operations are disabled.');
@@ -92,327 +142,79 @@ class MicrosoftGraphServer {
         10
       );
 
-      if (!process.env.MS365_MCP_CLIENT_ID || !process.env.MS365_MCP_CLIENT_SECRET) {
-        logger.error(
-          'FATAL: MS365_MCP_CLIENT_ID and MS365_MCP_CLIENT_SECRET environment variables are required in HTTP mode.'
-        );
-        process.exit(1);
-      }
-
       const app = express();
       app.use(express.json());
-      app.use(express.urlencoded({ extended: true }));
 
-      // Add CORS headers for all routes
-      app.use((req, res, next) => {
+      app.use((req, res, next: NextFunction) => {
         res.header('Access-Control-Allow-Origin', '*');
-        res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+        res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
         res.header(
           'Access-Control-Allow-Headers',
-          'Origin, X-Requested-With, Content-Type, Accept, Authorization, mcp-protocol-version'
+          'Origin, X-Requested-With, Content-Type, Accept, Authorization'
         );
-
-        // Handle preflight requests
         if (req.method === 'OPTIONS') {
           res.sendStatus(200);
           return;
         }
-
         next();
       });
 
-      const oauthProvider = new MicrosoftOAuthProvider(this.authManager);
+      // Simple Bearer Token Auth Middleware
+      const apiKeys = (process.env.MCP_SERVER_API_KEYS || '').split(',').filter(Boolean);
+      if (apiKeys.length === 0) {
+        logger.warn('Warning: MCP_SERVER_API_KEYS is not set. The server is unprotected.');
+      }
 
-      // OAuth Authorization Server Discovery
-      app.get('/.well-known/oauth-authorization-server', async (req, res) => {
-        const url = new URL(`${req.protocol}://${req.get('host')}`);
-        res.json({
-          issuer: url.origin,
-          authorization_endpoint: `${url.origin}/authorize`,
-          token_endpoint: `${url.origin}/token`,
-          registration_endpoint: `${url.origin}/register`,
-          response_types_supported: ['code'],
-          response_modes_supported: ['query'],
-          grant_types_supported: ['authorization_code', 'refresh_token'],
-          token_endpoint_auth_methods_supported: ['none'],
-          code_challenge_methods_supported: ['S256'],
-          scopes_supported: ['User.Read', 'Files.Read', 'Mail.Read'],
-        });
-      });
-
-      // OAuth Protected Resource Discovery
-      app.get('/.well-known/oauth-protected-resource', async (req, res) => {
-        const url = new URL(`${req.protocol}://${req.get('host')}`);
-        res.json({
-          resource: `${url.origin}/mcp`,
-          authorization_servers: [url.origin],
-          scopes_supported: ['User.Read', 'Files.Read', 'Mail.Read'],
-          bearer_methods_supported: ['header'],
-          resource_documentation: `${url.origin}`,
-        });
-      });
-
-      // Dynamic Client Registration endpoint
-      app.post('/register', async (req, res) => {
-        const body = req.body;
-
-        // Generate a client ID
-        const clientId = crypto.randomUUID();
-
-        // Store the client registration
-        registeredClients.set(clientId, {
-          client_id: clientId,
-          client_name: body.client_name || 'MCP Client',
-          redirect_uris: body.redirect_uris || [],
-          grant_types: body.grant_types || ['authorization_code', 'refresh_token'],
-          response_types: body.response_types || ['code'],
-          scope: body.scope,
-          token_endpoint_auth_method: 'none',
-          created_at: Date.now(),
-        });
-
-        // Return the client registration response
-        res.status(201).json({
-          client_id: clientId,
-          client_name: body.client_name || 'MCP Client',
-          redirect_uris: body.redirect_uris || [],
-          grant_types: body.grant_types || ['authorization_code', 'refresh_token'],
-          response_types: body.response_types || ['code'],
-          scope: body.scope,
-          token_endpoint_auth_method: 'none',
-        });
-      });
-
-      // Authorization endpoint - redirects to Microsoft
-      app.get('/authorize', async (req, res) => {
-        const url = new URL(req.url!, `${req.protocol}://${req.get('host')}`);
-        const tenantId = process.env.MS365_MCP_TENANT_ID || 'common';
-        const clientId = process.env.MS365_MCP_CLIENT_ID || '084a3e9f-a9f4-43f7-89f9-d229cf97853e';
-        const microsoftAuthUrl = new URL(
-          `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize`
-        );
-
-        // Only forward parameters that Microsoft OAuth 2.0 v2.0 supports
-        const allowedParams = [
-          'response_type',
-          'redirect_uri',
-          'scope',
-          'state',
-          'response_mode',
-          'code_challenge',
-          'code_challenge_method',
-          'prompt',
-          'login_hint',
-          'domain_hint',
-        ];
-
-        allowedParams.forEach((param) => {
-          const value = url.searchParams.get(param);
-          if (value) {
-            microsoftAuthUrl.searchParams.set(param, value);
-          }
-        });
-
-        // Use our Microsoft app's client_id
-        microsoftAuthUrl.searchParams.set('client_id', clientId);
-
-        // Ensure we have the minimal required scopes if none provided
-        if (!microsoftAuthUrl.searchParams.get('scope')) {
-          microsoftAuthUrl.searchParams.set('scope', 'User.Read Files.Read Mail.Read');
+      const simpleBearerAuthMiddleware = (req: Request, res: Response, next: NextFunction) => {
+        if (apiKeys.length === 0) {
+          return next(); // No keys configured, allow access
         }
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+          return res.status(401).json({ error: 'Unauthorized: Missing Bearer token' });
+        }
+        const token = authHeader.substring(7);
+        if (!apiKeys.includes(token)) {
+          return res.status(403).json({ error: 'Forbidden: Invalid API Key' });
+        }
+        next();
+      };
 
-        // Redirect to Microsoft's authorization page
-        res.redirect(microsoftAuthUrl.toString());
-      });
-
-      // Token exchange endpoint
-      app.post('/token', async (req, res) => {
+      // OpenAPI Spec Endpoint
+      app.get('/openapi.json', (req, res) => {
         try {
-          // Comprehensive debugging
-          logger.info('Token endpoint called', {
-            method: req.method,
-            url: req.url,
-            headers: req.headers,
-            bodyType: typeof req.body,
-            body: req.body,
-            rawBody: JSON.stringify(req.body),
-            contentType: req.get('Content-Type'),
-          });
-
-          const body = req.body;
-
-          // Add debugging and validation
-          if (!body) {
-            logger.error('Token endpoint: Request body is undefined');
-            res.status(400).json({
-              error: 'invalid_request',
-              error_description: 'Request body is required',
-            });
-            return;
-          }
-
-          if (!body.grant_type) {
-            logger.error('Token endpoint: grant_type is missing', { body });
-            res.status(400).json({
-              error: 'invalid_request',
-              error_description: 'grant_type parameter is required',
-            });
-            return;
-          }
-
-          if (body.grant_type === 'authorization_code') {
-            const tenantId = process.env.MS365_MCP_TENANT_ID || 'common';
-            const clientId =
-              process.env.MS365_MCP_CLIENT_ID || '084a3e9f-a9f4-43f7-89f9-d229cf97853e';
-            const clientSecret = process.env.MS365_MCP_CLIENT_SECRET;
-
-            if (!clientSecret) {
-              logger.error('Token endpoint: MS365_MCP_CLIENT_SECRET is not configured');
-              res.status(500).json({
-                error: 'server_error',
-                error_description: 'Server configuration error',
-              });
-              return;
-            }
-
-            const result = await exchangeCodeForToken(
-              body.code as string,
-              body.redirect_uri as string,
-              clientId,
-              clientSecret,
-              tenantId,
-              body.code_verifier as string | undefined
-            );
-            res.json(result);
-          } else if (body.grant_type === 'refresh_token') {
-            const tenantId = process.env.MS365_MCP_TENANT_ID || 'common';
-            const clientId =
-              process.env.MS365_MCP_CLIENT_ID || '084a3e9f-a9f4-43f7-89f9-d229cf97853e';
-            const clientSecret = process.env.MS365_MCP_CLIENT_SECRET;
-
-            if (!clientSecret) {
-              logger.error('Token endpoint: MS365_MCP_CLIENT_SECRET is not configured');
-              res.status(500).json({
-                error: 'server_error',
-                error_description: 'Server configuration error',
-              });
-              return;
-            }
-
-            const result = await refreshAccessToken(
-              body.refresh_token as string,
-              clientId,
-              clientSecret,
-              tenantId
-            );
-            res.json(result);
-          } else {
-            res.status(400).json({
-              error: 'unsupported_grant_type',
-              error_description: `Grant type '${body.grant_type}' is not supported`,
-            });
-          }
+          const spec = this.generateOpenAPISpec(req);
+          res.json(spec);
         } catch (error) {
-          logger.error('Token endpoint error:', error);
-          res.status(500).json({
-            error: 'server_error',
-            error_description: 'Internal server error during token exchange',
-          });
+          logger.error('Error generating OpenAPI spec:', error);
+          res.status(500).json({ error: 'Failed to generate OpenAPI spec' });
         }
       });
 
-      app.use(
-        mcpAuthRouter({
-          provider: oauthProvider,
-          issuerUrl: new URL(`http://localhost:${port}`),
-        })
-      );
-
-      // Microsoft Graph MCP endpoints with bearer token auth
-      // Handle both GET and POST methods as required by MCP Streamable HTTP specification
-      app.get(
-        '/mcp',
-        microsoftBearerTokenAuthMiddleware,
-        async (
-          req: Request & { microsoftAuth?: { accessToken: string; refreshToken: string } },
-          res: Response
-        ) => {
-          try {
-            // Set OAuth tokens in the GraphClient if available
-            if (req.microsoftAuth) {
-              this.graphClient.setOAuthTokens(
-                req.microsoftAuth.accessToken,
-                req.microsoftAuth.refreshToken
-              );
-            }
-
-            const transport = new StreamableHTTPServerTransport({
-              sessionIdGenerator: undefined, // Stateless mode
+      // All tool calls now go to a single MCP endpoint
+      const mcpHandler = async (req: Request, res: Response) => {
+        try {
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined, // Stateless mode
+          });
+          res.on('close', () => transport.close());
+          await this.server!.connect(transport);
+          // The MCP SDK handles both GET and POST appropriately via handleRequest
+          await transport.handleRequest(req as IncomingMessage, res as ServerResponse, req.body);
+        } catch (error) {
+          logger.error(`Error handling MCP ${req.method} request:`, error);
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Internal server error' },
+              id: null,
             });
-
-            res.on('close', () => {
-              transport.close();
-            });
-
-            await this.server!.connect(transport);
-            await transport.handleRequest(req as any, res as any, undefined);
-          } catch (error) {
-            logger.error('Error handling MCP GET request:', error);
-            if (!res.headersSent) {
-              res.status(500).json({
-                jsonrpc: '2.0',
-                error: {
-                  code: -32603,
-                  message: 'Internal server error',
-                },
-                id: null,
-              });
-            }
           }
         }
-      );
+      };
 
-      app.post(
-        '/mcp',
-        microsoftBearerTokenAuthMiddleware,
-        async (
-          req: Request & { microsoftAuth?: { accessToken: string; refreshToken: string } },
-          res: Response
-        ) => {
-          try {
-            // Set OAuth tokens in the GraphClient if available
-            if (req.microsoftAuth) {
-              this.graphClient.setOAuthTokens(
-                req.microsoftAuth.accessToken,
-                req.microsoftAuth.refreshToken
-              );
-            }
-
-            const transport = new StreamableHTTPServerTransport({
-              sessionIdGenerator: undefined, // Stateless mode
-            });
-
-            res.on('close', () => {
-              transport.close();
-            });
-
-            await this.server!.connect(transport);
-            await transport.handleRequest(req as any, res as any, req.body);
-          } catch (error) {
-            logger.error('Error handling MCP POST request:', error);
-            if (!res.headersSent) {
-              res.status(500).json({
-                jsonrpc: '2.0',
-                error: {
-                  code: -32603,
-                  message: 'Internal server error',
-                },
-                id: null,
-              });
-            }
-          }
-        }
-      );
+      // Protect the single /mcp endpoint
+      app.use('/mcp', simpleBearerAuthMiddleware, mcpHandler);
 
       // Health check endpoint
       app.get('/', (req, res) => {
@@ -422,10 +224,7 @@ class MicrosoftGraphServer {
       app.listen(port, () => {
         logger.info(`Server listening on HTTP port ${port}`);
         logger.info(`  - MCP endpoint: http://localhost:${port}/mcp`);
-        logger.info(`  - OAuth endpoints: http://localhost:${port}/auth/*`);
-        logger.info(
-          `  - OAuth discovery: http://localhost:${port}/.well-known/oauth-authorization-server`
-        );
+        logger.info(`  - OpenAPI Spec: http://localhost:${port}/openapi.json`);
       });
     } else {
       const transport = new StdioServerTransport();
