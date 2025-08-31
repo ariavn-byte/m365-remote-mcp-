@@ -236,7 +236,7 @@ class MicrosoftGraphServer {
             contentType: req.get('Content-Type'),
           });
 
-          const body = req.body;
+          const {body} = req;
 
           // Add debugging and validation
           if (!body) {
