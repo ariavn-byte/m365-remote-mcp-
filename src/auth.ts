@@ -1,4 +1,4 @@
-import type { AccountInfo, Configuration } from '@azure/msal-node';
+    import type { AccountInfo, Configuration } from '@azure/msal-node';
 import { PublicClientApplication } from '@azure/msal-node';
 import logger from './logger.js';
 import fs, { existsSync, readFileSync } from 'fs';
@@ -462,3 +462,4 @@ class AuthManager {
 
 export default AuthManager;
 export { buildScopesFromEndpoints };
+
