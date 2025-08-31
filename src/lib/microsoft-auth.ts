@@ -23,7 +23,15 @@ export const microsoftBearerTokenAuthMiddleware = (
   // and handle token refresh in the GraphClient
 
   // Extract refresh token from a custom header (if provided)
-  const refreshToken = (req.headers['x-microsoft-refresh-token'] as string) || '';
+  // NOTE: The use of 'x-microsoft-refresh-token' is a custom, non-standard header.
+  // Consider using a more standard approach, such as including the refresh token in the request body
+  // or following OAuth conventions (e.g., using the Authorization header or cookies).
+  // For now, we support both the custom header and the request body for refresh token.
+
+  const refreshToken =
+    (req.headers['x-microsoft-refresh-token'] as string) ||
+    (req.body?.refresh_token as string) ||
+    '';
 
   // Store tokens in request for later use
   req.microsoftAuth = {
